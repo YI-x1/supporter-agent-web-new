@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>采集端：RODE 采集助手（稳定版）</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:#F8FAFC; text-align:center; padding:40px; color:#0F172A;}
+    .container { max-width: 860px; margin:0 auto; background:#fff; padding:28px; border-radius:20px; box-shadow:0 10px 15px -3px rgba(0,0,0,.1); }
+    .name-row { display:flex; gap:16px; margin-bottom:22px; }
+    .name-input { flex:1; text-align:left; }
+    input { width:100%; padding:12px; border:1px solid #E2E8F0; border-radius:10px; font-size:16px; margin-top:6px; outline:none;}
+    .wave-row { margin-bottom: 18px; text-align:left; }
+    .wave-container { height: 90px; background:#F1F5F9; border-radius:15px; display:flex; align-items:center; justify-content:center; position:relative; overflow:hidden; border:1px solid #E2E8F0; }
+    .wave-bar { width:95%; height:46px; background: linear-gradient(90deg, #A78BFA, #818CF8, #A78BFA); border-radius:25px; transition: transform .05s ease-out; transform: scaleY(.25); }
+    #status { padding: 14px; border-radius:10px; margin-top: 14px; font-weight:700; }
+    .waiting { background:#FEF3C7; color:#92400E; }
+    .active { background:#DCFCE7; color:#166534; }
+    button { background:#A78BFA; color:#fff; border:none; padding:12px 18px; border-radius:10px; cursor:pointer; font-size:16px; width:100%; }
+    .muted { color:#64748B; font-size:13px; margin-top:10px;}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>采集端：RODE 采集助手</h1>
+    <div class="muted" id="sidTip"></div>
+
+    <div class="name-row">
+      <div class="name-input">
+        <label>说话人1 (左/L)：</label>
+        <input type="text" id="nameL" value="女儿">
+      </div>
+      <div class="name-input">
+        <label>说话人2 (右/R)：</label>
+        <input type="text" id="nameR" value="医生">
+      </div>
+    </div>
+
+    <div class="wave-row">
+      <div id="labelL">🎤 女儿</div>
+      <div class="wave-container"><div id="waveL" class="wave-bar"></div></div>
+    </div>
+
+    <div class="wave-row">
+      <div id="labelR">🎤 医生</div>
+      <div class="wave-container"><div id="waveR" class="wave-bar"></div></div>
+    </div>
+
+    <div class="name-row">
+      <div class="name-input">
+        <label>测试文本发送：</label>
+        <input type="text" id="textPayload" placeholder="输入转录文本（仅测试）">
+      </div>
+      <div class="name-input" style="display:flex; align-items:flex-end;">
+        <div style="display:flex; gap:10px; width:100%">
+          <button style="flex:1" onclick="sendText('L')">发送为说话人1</button>
+          <button style="flex:1" onclick="sendText('R')">发送为说话人2</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="status" class="waiting">🔴 录音未授权，等待老人指令...</div>
+<div class="muted" style="text-align:left;margin-top:12px">
+  <b>双声道采集：</b>点击开始后，对着左右麦分别讲话，老人端会显示对应说话人的实时字幕。
+</div>
+<div style="display:flex; gap:10px; margin-top:12px">
+  <button id="btnStartAudio" style="flex:1">开始采集并上传音频</button>
+  <button id="btnStopAudio" style="flex:1; background:#0F172A" disabled>停止</button>
+</div>
+  </div>
+
+<script>
+  // ----- params -----
+  const params = new URLSearchParams(location.search);
+  const sessionId = params.get("session_id") || "";
+  document.getElementById("sidTip").textContent = sessionId ? `Session: ${sessionId} · Dual-Channel Mode` : "⚠️ 缺少 session_id 参数，请从老人端复制加入链接";
+
+  // ----- state -----
+  let ws = null;
+  let reconnectTimer = null;
+  let isActive = true; // server-controlled recording gate
+
+  function wsUrl() {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    return `${proto}://${location.host}/ws/client?session_id=${encodeURIComponent(sessionId)}`;
+  }
+
+  function connectWS() {
+    if (!sessionId) return;
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+
+    ws = new WebSocket(wsUrl());
+
+    ws.onopen = () => {
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      updateNames(true);
+    };
+
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+
+      if (data.type === "ping") {
+        ws.send(JSON.stringify({type:"pong", ts: data.ts}));
+        return;
+      }
+
+      if (data.type === "volume") {
+        document.getElementById('waveL').style.transform = `scaleY(${0.2 + (data.L||0) * 2.5})`;
+        document.getElementById('waveR').style.transform = `scaleY(${0.2 + (data.R||0) * 2.5})`;
+        return;
+      }
+
+      if (data.type === "status") {
+        isActive = !!data.active;
+        const s = document.getElementById('status');
+        s.innerText = isActive ? "🟢 录音已授权，正在传输..." : "🟡 录音未授权，等待老人指令...";
+        s.className = isActive ? "active" : "waiting";
+        return;
+      }
+
+      if (data.type === "names") {
+        // server may push latest names; keep local as-is
+        return;
+      }
+    };
+
+    ws.onclose = () => scheduleReconnect();
+    ws.onerror = () => scheduleReconnect();
+  }
+
+  function scheduleReconnect() {
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connectWS();
+    }, 1200);
+  }
+
+  // ----- UI actions -----
+  function updateNames(force=false) {
+    const nL = document.getElementById('nameL').value;
+    const nR = document.getElementById('nameR').value;
+    document.getElementById('labelL').innerText = "🎤 " + nL;
+    document.getElementById('labelR').innerText = "🎤 " + nR;
+
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({type:"names", L:nL, R:nR}));
+    }
+  }
+
+  document.getElementById("nameL").addEventListener("change", () => updateNames(true));
+  document.getElementById("nameR").addEventListener("change", () => updateNames(true));
+
+  function sendText(which) {
+    const payload = document.getElementById('textPayload').value.trim();
+    if (!payload) return;
+
+    const speaker = (which === "R") ? document.getElementById('nameR').value : document.getElementById('nameL').value;
+
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({type:"transcript", speaker, content: payload, phase:"discussion", channel: which}));
+    }
+    document.getElementById('textPayload').value = "";
+  }
+
+
+  // ----- Audio capture (stereo -> 2 mono 16k PCM16 frames) -----
+  let audioCtx = null;
+  let mediaStream = null;
+  let sourceNode = null;
+  let processor = null; // ScriptProcessorNode (demo). For production, use AudioWorklet.
+  let seqL = 0, seqR = 0;
+  const targetRate = 16000;
+
+  function floatToPCM16(float32) {
+    const out = new Int16Array(float32.length);
+    for (let i=0;i<float32.length;i++) {
+      let s = Math.max(-1, Math.min(1, float32[i]));
+      out[i] = s < 0 ? s * 32768 : s * 32767;
+    }
+    return out;
+  }
+
+  function downsampleBuffer(buffer, inRate, outRate) {
+    if (outRate === inRate) return buffer;
+    const ratio = inRate / outRate;
+    const newLen = Math.round(buffer.length / ratio);
+    const result = new Float32Array(newLen);
+    let offsetResult = 0;
+    let offsetBuffer = 0;
+    while (offsetResult < result.length) {
+      const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+      let sum = 0, count = 0;
+      for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+        sum += buffer[i];
+        count++;
+      }
+      result[offsetResult] = sum / Math.max(1, count);
+      offsetResult++;
+      offsetBuffer = nextOffsetBuffer;
+    }
+    return result;
+  }
+
+  function packFrame(channelId, seq, pcm16) {
+    // 1 byte channel + 4 bytes seq (uint32 LE) + payload bytes
+    const payload = new Uint8Array(pcm16.buffer);
+    const buf = new ArrayBuffer(1 + 4 + payload.length);
+    const view = new DataView(buf);
+    view.setUint8(0, channelId);
+    view.setUint32(1, seq, true);
+    new Uint8Array(buf, 5).set(payload);
+    return buf;
+  }
+
+  async function startAudio() {
+    if (!sessionId) { alert("缺少 session_id"); return; }
+    if (!ws || ws.readyState !== WebSocket.OPEN) { alert("WS 未连接"); return; }
+
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: { ideal: 2 }, echoCancellation:false, noiseSuppression:false, autoGainControl:false }
+      });
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const inRate = audioCtx.sampleRate;
+
+      sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+
+      // Demo uses ScriptProcessor (deprecated but simple).
+      processor = audioCtx.createScriptProcessor(4096, 2, 2);
+
+      processor.onaudioprocess = (e) => {
+        // Respect master control: only send when "active"
+        if (!isActive) return;
+
+        const chL = e.inputBuffer.getChannelData(0);
+        const chR = e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : e.inputBuffer.getChannelData(0);
+
+        const dsL = downsampleBuffer(chL, inRate, targetRate);
+        const dsR = downsampleBuffer(chR, inRate, targetRate);
+
+        const MAX_BUFFERED = 1_000_000; // 1MB
+        if (ws && ws.bufferedAmount > MAX_BUFFERED) {
+          // network/back-end can't keep up; drop this chunk to keep WS alive
+          return;
+        }
+
+        // split into 20ms frames (320 samples at 16k)
+        const frameSize = 320;
+        for (let i=0;i+frameSize<=dsL.length;i+=frameSize) {
+          const frameL = dsL.subarray(i, i+frameSize);
+          const frameR = dsR.subarray(i, i+frameSize);
+
+          const pcmL = floatToPCM16(frameL);
+          const pcmR = floatToPCM16(frameR);
+
+          const bufL = packFrame(0, (seqL++ >>> 0), pcmL);
+          const bufR = packFrame(1, (seqR++ >>> 0), pcmR);
+
+          try { ws.send(bufL); } catch(err) {}
+          try { ws.send(bufR); } catch(err) {}
+        }
+      };
+
+      sourceNode.connect(processor);
+      processor.connect(audioCtx.destination);
+
+      document.getElementById("btnStartAudio").disabled = true;
+      document.getElementById("btnStopAudio").disabled = false;
+    } catch (err) {
+      alert("无法获取麦克风权限或设备不可用：" + err);
+    }
+  }
+
+  function stopAudio() {
+    try { if (processor) processor.disconnect(); } catch(e){}
+    try { if (sourceNode) sourceNode.disconnect(); } catch(e){}
+    try { if (mediaStream) mediaStream.getTracks().forEach(t => t.stop()); } catch(e){}
+    try { if (audioCtx) audioCtx.close(); } catch(e){}
+    audioCtx = null; mediaStream = null; sourceNode = null; processor = null;
+    document.getElementById("btnStartAudio").disabled = false;
+    document.getElementById("btnStopAudio").disabled = true;
+  }
+
+
+  // ----- boot -----
+  updateNames(false);
+  connectWS();
+  document.getElementById("btnStartAudio").addEventListener("click", startAudio);
+  document.getElementById("btnStopAudio").addEventListener("click", stopAudio);
+</script>
+</body>
+</html>
