@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>采集端：RODE 采集助手（稳定版）</title>
+  <title>采集端：RODE 采集助手（阶段门控版）</title>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:#F8FAFC; text-align:center; padding:40px; color:#0F172A;}
     .container { max-width: 860px; margin:0 auto; background:#fff; padding:28px; border-radius:20px; box-shadow:0 10px 15px -3px rgba(0,0,0,.1); }
@@ -13,16 +13,18 @@
     .wave-row { margin-bottom: 18px; text-align:left; }
     .wave-container { height: 90px; background:#F1F5F9; border-radius:15px; display:flex; align-items:center; justify-content:center; position:relative; overflow:hidden; border:1px solid #E2E8F0; }
     .wave-bar { width:95%; height:46px; background: linear-gradient(90deg, #A78BFA, #818CF8, #A78BFA); border-radius:25px; transition: transform .05s ease-out; transform: scaleY(.25); }
-    #status { padding: 14px; border-radius:10px; margin-top: 14px; font-weight:700; }
+    #status { padding: 14px; border-radius:10px; margin-top: 14px; font-weight:700; text-align:left; }
     .waiting { background:#FEF3C7; color:#92400E; }
     .active { background:#DCFCE7; color:#166534; }
+    .off { background:#E2E8F0; color:#0F172A; }
     button { background:#A78BFA; color:#fff; border:none; padding:12px 18px; border-radius:10px; cursor:pointer; font-size:16px; width:100%; }
     .muted { color:#64748B; font-size:13px; margin-top:10px;}
+    .badge { display:inline-block; padding:2px 8px; border-radius:999px; background:#EEF2FF; border:1px solid #C7D2FE; color:#3730A3; font-size:12px; margin-left:8px;}
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>采集端：RODE 采集助手</h1>
+    <h1>采集端：RODE 采集助手 <span class="badge" id="phaseBadge">阶段：讨论中</span></h1>
     <div class="muted" id="sidTip"></div>
 
     <div class="name-row">
@@ -48,7 +50,7 @@
 
     <div class="name-row">
       <div class="name-input">
-        <label>测试文本发送：</label>
+        <label>测试文本发送（仅调试）：</label>
         <input type="text" id="textPayload" placeholder="输入转录文本（仅测试）">
       </div>
       <div class="name-input" style="display:flex; align-items:flex-end;">
@@ -59,14 +61,16 @@
       </div>
     </div>
 
-    <div id="status" class="waiting">🔴 录音未授权，等待老人指令...</div>
-<div class="muted" style="text-align:left;margin-top:12px">
-  <b>双声道采集：</b>点击开始后，对着左右麦分别讲话，老人端会显示对应说话人的实时字幕。
-</div>
-<div style="display:flex; gap:10px; margin-top:12px">
-  <button id="btnStartAudio" style="flex:1">开始采集并上传音频</button>
-  <button id="btnStopAudio" style="flex:1; background:#0F172A" disabled>停止</button>
-</div>
+    <div id="status" class="waiting">🔴 等待老人端进入“讨论中”并授权采集端...</div>
+
+    <div class="muted" style="text-align:left;margin-top:12px">
+      <b>双声道采集：</b>仅在老人端处于<strong>“讨论中”</strong>阶段时才会真正被接收和转录。
+    </div>
+
+    <div style="display:flex; gap:10px; margin-top:12px">
+      <button id="btnStartAudio" style="flex:1">开始采集并上传音频</button>
+      <button id="btnStopAudio" style="flex:1; background:#0F172A" disabled>停止</button>
+    </div>
   </div>
 
 <script>
@@ -78,8 +82,32 @@
   // ----- state -----
   let ws = null;
   let reconnectTimer = null;
-  let isActive = true; // server-controlled recording gate
 
+  let recordAuthorized = false;     // from master set_active
+  let phaseNow = "discussion";      // from master set_phase
+  let canStream = false;            // recordAuthorized && phaseNow === "discussion"
+
+  function computeCanStream() {
+    canStream = recordAuthorized && (phaseNow === "discussion");
+    const s = document.getElementById("status");
+    const badge = document.getElementById("phaseBadge");
+
+    const phaseLabel = phaseNow === "preparation" ? "讨论前" : (phaseNow === "review" ? "讨论后" : "讨论中");
+    badge.textContent = `阶段：${phaseLabel}`;
+
+    if (!recordAuthorized) {
+      s.innerText = "🟡 采集端未授权（老人端可切换：授权采集端：关）";
+      s.className = "waiting";
+    } else if (phaseNow !== "discussion") {
+      s.innerText = `⏸️ 当前阶段为“${phaseLabel}”，采集端音频不会被接收（仅讨论中接收）`;
+      s.className = "off";
+    } else {
+      s.innerText = "🟢 已授权且处于“讨论中”，正在传输并参与转录...";
+      s.className = "active";
+    }
+  }
+
+  // ----- ws -----
   function wsUrl() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     return `${proto}://${location.host}/ws/client?session_id=${encodeURIComponent(sessionId)}`;
@@ -104,33 +132,34 @@
         return;
       }
 
-      
-if (data.type === "volume") {
-  // 兼容两种格式：
-  // 1) legacy: {L:0.1, R:0.2}
-  // 2) new: {channel:"L"/"R"/"E", value:0.3}
-  if (data.channel) {
-    const ch = String(data.channel).toUpperCase();
-    const v = data.value || 0;
-    if (ch === "L") document.getElementById('waveL').style.transform = `scaleY(${0.2 + v * 2.5})`;
-    if (ch === "R") document.getElementById('waveR').style.transform = `scaleY(${0.2 + v * 2.5})`;
-  } else {
-    document.getElementById('waveL').style.transform = `scaleY(${0.2 + (data.L||0) * 2.5})`;
-    document.getElementById('waveR').style.transform = `scaleY(${0.2 + (data.R||0) * 2.5})`;
-  }
-  return;
-}
-
-      if (data.type === "status") {
-        isActive = !!data.active;
-        const s = document.getElementById('status');
-        s.innerText = isActive ? "🟢 录音已授权，正在传输..." : "🟡 录音未授权，等待老人指令...";
-        s.className = isActive ? "active" : "waiting";
+      if (data.type === "phase") {
+        phaseNow = String(data.phase || "discussion");
+        if (!["preparation","discussion","review"].includes(phaseNow)) phaseNow = "discussion";
+        computeCanStream();
         return;
       }
 
-      if (data.type === "names") {
-        // server may push latest names; keep local as-is
+      if (data.type === "status") {
+        recordAuthorized = !!data.active;
+        if (data.phase) {
+          phaseNow = String(data.phase);
+          if (!["preparation","discussion","review"].includes(phaseNow)) phaseNow = "discussion";
+        }
+        computeCanStream();
+        return;
+      }
+
+      if (data.type === "volume") {
+        // compatible: new format {channel,value} or old {L,R}
+        if (data.channel) {
+          const ch = String(data.channel).toUpperCase();
+          const v = data.value || 0;
+          if (ch === "L") document.getElementById("waveL").style.transform = `scaleY(${0.2 + v * 2.5})`;
+          if (ch === "R") document.getElementById("waveR").style.transform = `scaleY(${0.2 + v * 2.5})`;
+        } else {
+          document.getElementById("waveL").style.transform = `scaleY(${0.2 + (data.L||0) * 2.5})`;
+          document.getElementById("waveR").style.transform = `scaleY(${0.2 + (data.R||0) * 2.5})`;
+        }
         return;
       }
     };
@@ -165,7 +194,6 @@ if (data.type === "volume") {
   function sendText(which) {
     const payload = document.getElementById('textPayload').value.trim();
     if (!payload) return;
-
     const speaker = (which === "R") ? document.getElementById('nameR').value : document.getElementById('nameL').value;
 
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -174,12 +202,11 @@ if (data.type === "volume") {
     document.getElementById('textPayload').value = "";
   }
 
-
   // ----- Audio capture (stereo -> 2 mono 16k PCM16 frames) -----
   let audioCtx = null;
   let mediaStream = null;
   let sourceNode = null;
-  let processor = null; // ScriptProcessorNode (demo). For production, use AudioWorklet.
+  let processor = null;
   let seqL = 0, seqR = 0;
   const targetRate = 16000;
 
@@ -202,19 +229,14 @@ if (data.type === "volume") {
     while (offsetResult < result.length) {
       const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
       let sum = 0, count = 0;
-      for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
-        sum += buffer[i];
-        count++;
-      }
+      for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) { sum += buffer[i]; count++; }
       result[offsetResult] = sum / Math.max(1, count);
-      offsetResult++;
-      offsetBuffer = nextOffsetBuffer;
+      offsetResult++; offsetBuffer = nextOffsetBuffer;
     }
     return result;
   }
 
   function packFrame(channelId, seq, pcm16) {
-    // 1 byte channel + 4 bytes seq (uint32 LE) + payload bytes
     const payload = new Uint8Array(pcm16.buffer);
     const buf = new ArrayBuffer(1 + 4 + payload.length);
     const view = new DataView(buf);
@@ -222,6 +244,12 @@ if (data.type === "volume") {
     view.setUint32(1, seq, true);
     new Uint8Array(buf, 5).set(payload);
     return buf;
+  }
+
+  function rms(buf){
+    let s=0;
+    for(let i=0;i<buf.length;i++){ const x=buf[i]; s += x*x; }
+    return Math.sqrt(s / Math.max(1, buf.length));
   }
 
   async function startAudio() {
@@ -232,44 +260,34 @@ if (data.type === "volume") {
       mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: { channelCount: { ideal: 2 }, echoCancellation:false, noiseSuppression:false, autoGainControl:false }
       });
+
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       const inRate = audioCtx.sampleRate;
 
       sourceNode = audioCtx.createMediaStreamSource(mediaStream);
 
-      // Demo uses ScriptProcessor (deprecated but simple).
       processor = audioCtx.createScriptProcessor(4096, 2, 2);
 
-      function rms(buf){
-        let s=0;
-        for(let i=0;i<buf.length;i++){ const x=buf[i]; s+=x*x; }
-        return Math.sqrt(s / Math.max(1, buf.length));
-      }
-
       processor.onaudioprocess = (e) => {
-        // Respect master control: only send when "active"
-        if (!isActive) return;
-
+        // local visualize (always)
         const chL = e.inputBuffer.getChannelData(0);
         const chR = e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : e.inputBuffer.getChannelData(0);
 
-        // --- local RMS visualize (no server dependency) ---
         const vL = Math.min(1.0, rms(chL) * 8.0);
         const vR = Math.min(1.0, rms(chR) * 8.0);
-        document.getElementById('waveL').style.transform = `scaleY(${0.2 + vL * 2.5})`;
-        document.getElementById('waveR').style.transform = `scaleY(${0.2 + vR * 2.5})`;
+        document.getElementById("waveL").style.transform = `scaleY(${0.2 + vL * 2.5})`;
+        document.getElementById("waveR").style.transform = `scaleY(${0.2 + vR * 2.5})`;
+
+        // Only stream when authorized AND phase is discussion
+        if (!canStream) return;
 
         const dsL = downsampleBuffer(chL, inRate, targetRate);
         const dsR = downsampleBuffer(chR, inRate, targetRate);
 
         const MAX_BUFFERED = 1_000_000; // 1MB
-        if (ws && ws.bufferedAmount > MAX_BUFFERED) {
-          // network/back-end can't keep up; drop this chunk to keep WS alive
-          return;
-        }
+        if (ws && ws.bufferedAmount > MAX_BUFFERED) return;
 
-        // split into 20ms frames (320 samples at 16k)
-        const frameSize = 320;
+        const frameSize = 320; // 20ms
         for (let i=0;i+frameSize<=dsL.length;i+=frameSize) {
           const frameL = dsL.subarray(i, i+frameSize);
           const frameR = dsR.subarray(i, i+frameSize);
@@ -305,9 +323,9 @@ if (data.type === "volume") {
     document.getElementById("btnStopAudio").disabled = true;
   }
 
-
   // ----- boot -----
   updateNames(false);
+  computeCanStream();
   connectWS();
   document.getElementById("btnStartAudio").addEventListener("click", startAudio);
   document.getElementById("btnStopAudio").addEventListener("click", stopAudio);

@@ -3,11 +3,11 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>老人端：Supporter-Agent（稳定版）</title>
+  <title>老人端：Supporter-Agent（阶段隔离版）</title>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:#F8FAFC; margin:0; display:flex; height:100vh; color:#0F172A; }
     #sidebar { width:320px; background:#fff; border-right:1px solid #E2E8F0; padding:18px; box-sizing:border-box; overflow:auto; }
-    #main { flex:1; display:flex; flex-direction:column; padding:18px; box-sizing:border-box; gap:12px; }
+    #main { flex:1; display:flex; flex-direction:column; padding:18px; box-sizing:border-box; gap:12px; min-width:0; }
     .btn { background:#A78BFA; color:#fff; border:none; padding:10px 12px; border-radius:10px; cursor:pointer; font-size:15px; width:100%; }
     .btn.dark { background:#1E293B; }
     .btn.ghost { background:#fff; color:#0F172A; border:1px solid #E2E8F0; }
@@ -15,14 +15,17 @@
     .row { display:flex; gap:10px; }
     .pill { padding:6px 10px; border-radius:999px; background:#E2E8F0; cursor:pointer; user-select:none; font-size:14px; }
     .pill.active { background:#A78BFA; color:#fff; }
-    .card { background:#fff; border:1px solid #E2E8F0; border-radius:16px; box-shadow: 0 4px 10px -6px rgba(0,0,0,.12); min-height:0; }
+    .card { background:#fff; border:1px solid #E2E8F0; border-radius:16px; box-shadow: 0 4px 10px -6px rgba(0,0,0,.12); }
+    /* critical: allow chat area to scroll inside flex column */
+    section.card { min-height:0; }
     #chat { flex:1; padding:16px; overflow:auto; min-height:0; }
     .msg { display:flex; margin:10px 0; }
     .msg.right { justify-content:flex-end; }
     .bubble { max-width:75%; padding:10px 12px; border-radius:14px; line-height:1.5; font-size:15px; }
     .bubble.user { background:#A78BFA; color:#fff; border-bottom-right-radius:6px; }
     .bubble.other { background:#F1F5F9; color:#0F172A; border-bottom-left-radius:6px; }
-    .meta { font-size:12px; opacity:.85; margin-bottom:4px; }
+    .meta { font-size:12px; opacity:.85; margin-bottom:4px; display:flex; gap:8px; align-items:center; }
+    .meta .time { opacity:.85; }
     #composer { display:flex; gap:10px; align-items:center; padding:12px; }
     #input { flex:1; padding:10px 12px; border:1px solid #E2E8F0; border-radius:12px; font-size:15px; outline:none; }
     .wave-box { height:66px; border-radius:40px; background:#F1F5F9; border:1px solid #E2E8F0; display:flex; align-items:center; justify-content:center; overflow:hidden; }
@@ -32,6 +35,7 @@
     .session-item.active { background:#EEF2FF; border-color:#C7D2FE; }
     .divider { height:1px; background:#E2E8F0; margin:12px 0; }
     code { background:#F1F5F9; padding:1px 6px; border-radius:8px; }
+    #micBanner { display:none; margin-top:10px; padding:10px 12px; border:1px solid #FDE68A; background:#FFFBEB; border-radius:12px; color:#92400E; }
   </style>
 </head>
 <body>
@@ -39,8 +43,16 @@
     <div class="row">
       <button class="btn" id="btnNew">➕ 开启新讨论</button>
     </div>
+
+    <div id="micBanner">
+      需要启用麦克风才能进行实时转录。
+      <div style="margin-top:8px">
+        <button class="btn" id="btnEnableMic">点击启用麦克风</button>
+      </div>
+    </div>
+
     <div style="margin-top:10px" class="muted">
-      采集端加入链接（单设备双声道）：
+      采集端加入链接（单设备双声道，仅“讨论中”接收）：
       <div style="margin-top:6px; line-height:1.6">
         <code id="joinDual"></code>
       </div>
@@ -54,7 +66,7 @@
   </aside>
 
   <main id="main">
-    <div class="row" style="gap:8px">
+    <div class="row" style="gap:8px; align-items:center;">
       <div class="pill" data-phase="preparation">讨论前</div>
       <div class="pill active" data-phase="discussion">讨论中</div>
       <div class="pill" data-phase="review">讨论后</div>
@@ -64,12 +76,13 @@
     </div>
 
     <section class="card" style="flex:1; display:flex; flex-direction:column;">
+      <div style="display:flex; gap:10px; padding:12px 16px; border-bottom:1px solid #E2E8F0;">
+        <div class="muted" id="capL" style="flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">说话人1：…</div>
+        <div class="muted" id="capR" style="flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; text-align:right;">…：说话人2</div>
+      </div>
 
-<div style="display:flex; gap:10px; padding:12px 16px; border-bottom:1px solid #E2E8F0;">
-  <div class="muted" id="capL" style="flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">说话人1：…</div>
-  <div class="muted" id="capR" style="flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; text-align:right;">…：说话人2</div>
-</div>
       <div id="chat"></div>
+
       <div class="divider" style="margin:0"></div>
       <div id="composer">
         <input id="input" placeholder="老人说一句…（回车发送）"/>
@@ -77,7 +90,7 @@
       </div>
     </section>
 
-    <div class="muted">🎙️ 老人端麦克风（实时音量 + 自动转写）</div>
+    <div class="muted">🎙️ 您的声音显化（实时音量）</div>
     <div class="wave-box card"><div id="wave" class="wave-bar"></div></div>
   </main>
 
@@ -96,168 +109,32 @@
     const pad = n => (n<10?("0"+n):n);
     return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
   }
+  function escapeHtml(str) {
+    return String(str).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
+      .replaceAll('"',"&quot;").replaceAll("'","&#039;").replaceAll("\n","<br/>");
+  }
 
   // ---------- state ----------
   let sessionId = qs("session_id");
-  let phase = qs("phase") || "discussion";
-  let mode = "live"; // live | view
-  let lastMsgId = 0;
+  let phase = qs("phase") || "discussion";        // preparation | discussion | review
+  let mode = "live";                               // live | view
   let recordActive = true;
   let ws = null;
   let reconnectTimer = null;
 
-let elderAudioWS = null;
-let elderReconnectTimer = null;
-let elderAudioCtx = null;
-let elderMediaStream = null;
-let elderSource = null;
-let elderProcessor = null;
-let elderSeq = 0;
-const ELDER_TARGET_RATE = 16000;
+  // phase-isolated message buffers
+  const phases = ["preparation", "discussion", "review"];
+  const messagesByPhase = { preparation: [], discussion: [], review: [] };
+  let lastMsgId = 0;
 
-function elderWsUrl() {
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  return `${proto}://${location.host}/ws/client?session_id=${encodeURIComponent(sessionId)}&channel=E`;
-}
+  // mic upload websocket (elder -> backend as channel E)
+  let wsMic = null;
+  let audioCtxE = null, mediaStreamE = null, sourceNodeE = null, processorE = null;
+  let seqE = 0;
+  const targetRateE = 16000;
+  let micReady = false;
 
-function connectElderAudioWS() {
-  if (mode !== "live") return;
-  if (!sessionId) return;
-  if (elderAudioWS && (elderAudioWS.readyState === WebSocket.OPEN || elderAudioWS.readyState === WebSocket.CONNECTING)) return;
-
-  elderAudioWS = new WebSocket(elderWsUrl());
-  elderAudioWS.binaryType = "arraybuffer";
-
-  elderAudioWS.onopen = () => { if (elderReconnectTimer) { clearTimeout(elderReconnectTimer); elderReconnectTimer=null; } };
-  elderAudioWS.onclose = () => scheduleElderReconnect();
-  elderAudioWS.onerror = () => scheduleElderReconnect();
-  elderAudioWS.onmessage = () => {};
-}
-
-function scheduleElderReconnect() {
-  if (mode !== "live") return;
-  if (elderReconnectTimer) return;
-  elderReconnectTimer = setTimeout(() => {
-    elderReconnectTimer = null;
-    connectElderAudioWS();
-  }, 1200);
-}
-
-function floatToPCM16(float32) {
-  const out = new Int16Array(float32.length);
-  for (let i=0;i<float32.length;i++) {
-    let s = Math.max(-1, Math.min(1, float32[i]));
-    out[i] = s < 0 ? s * 32768 : s * 32767;
-  }
-  return out;
-}
-
-function downsampleBuffer(buffer, inRate, outRate) {
-  if (outRate === inRate) return buffer;
-  const ratio = inRate / outRate;
-  const newLen = Math.round(buffer.length / ratio);
-  const result = new Float32Array(newLen);
-  let offsetResult = 0;
-  let offsetBuffer = 0;
-  while (offsetResult < result.length) {
-    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
-    let sum = 0, count = 0;
-    for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
-      sum += buffer[i];
-      count++;
-    }
-    result[offsetResult] = sum / Math.max(1, count);
-    offsetResult++;
-    offsetBuffer = nextOffsetBuffer;
-  }
-  return result;
-}
-
-function packElderFrame(seq, pcm16) {
-  const payload = new Uint8Array(pcm16.buffer);
-  const buf = new ArrayBuffer(1 + 4 + payload.length);
-  const view = new DataView(buf);
-  view.setUint8(0, 2); // elder channel id
-  view.setUint32(1, seq >>> 0, true);
-  new Uint8Array(buf, 5).set(payload);
-  return buf;
-}
-
-function rms(buf){
-  let s=0;
-  for(let i=0;i<buf.length;i++){ const x=buf[i]; s+=x*x; }
-  return Math.sqrt(s / Math.max(1, buf.length));
-}
-
-async function startElderMicAuto() {
-  if (mode !== "live") return;
-  connectElderAudioWS();
-
-  try {
-    if (!elderMediaStream) {
-      elderMediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false }
-      });
-    }
-
-    if (!elderAudioCtx) elderAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const inRate = elderAudioCtx.sampleRate;
-
-    if (elderAudioCtx.state === "suspended") {
-      // show a hint
-      document.querySelector(".muted").textContent = "🎙️ 需要一次点击以启用麦克风（点击页面任意处）";
-    }
-
-    elderSource = elderAudioCtx.createMediaStreamSource(elderMediaStream);
-    elderProcessor = elderAudioCtx.createScriptProcessor(4096, 1, 1);
-
-    elderProcessor.onaudioprocess = (e) => {
-      if (mode !== "live") return;
-      const ch = e.inputBuffer.getChannelData(0);
-
-      // local volume visualize
-      const v = Math.min(1.0, rms(ch) * 8.0);
-      elWave.style.transform = `scaleY(${0.35 + v * 2.2})`;
-
-      if (!elderAudioWS || elderAudioWS.readyState !== WebSocket.OPEN) return;
-
-      const ds = downsampleBuffer(ch, inRate, ELDER_TARGET_RATE);
-
-      const frameSize = 320; // 20ms @16k
-      for (let i=0;i+frameSize<=ds.length;i+=frameSize) {
-        const frame = ds.subarray(i, i+frameSize);
-        const pcm16 = floatToPCM16(frame);
-        const buf = packElderFrame(elderSeq++, pcm16);
-        try { elderAudioWS.send(buf); } catch(e) {}
-      }
-    };
-
-    elderSource.connect(elderProcessor);
-    elderProcessor.connect(elderAudioCtx.destination);
-
-    const resume = async () => {
-      try { if (elderAudioCtx && elderAudioCtx.state === "suspended") await elderAudioCtx.resume(); } catch(e) {}
-      document.querySelector(".muted").textContent = "🎙️ 老人端麦克风（实时音量 + 自动转写）";
-    };
-    document.addEventListener("click", resume, {once:true});
-
-  } catch (err) {
-    console.warn("Elder mic init failed:", err);
-  }
-}
-
-function stopElderMic() {
-  try { if (elderProcessor) elderProcessor.disconnect(); } catch(e){}
-  try { if (elderSource) elderSource.disconnect(); } catch(e){}
-  try { if (elderMediaStream) elderMediaStream.getTracks().forEach(t => t.stop()); } catch(e){}
-  try { if (elderAudioCtx) elderAudioCtx.close(); } catch(e){}
-  elderAudioCtx = null; elderMediaStream=null; elderSource=null; elderProcessor=null;
-  elderSeq = 0;
-  try { if (elderAudioWS) elderAudioWS.close(); } catch(e){}
-  elderAudioWS = null;
-}
-
-
+  // ---------- elements ----------
   const elChat = document.getElementById("chat");
   const elInput = document.getElementById("input");
   const elWave = document.getElementById("wave");
@@ -268,6 +145,10 @@ function stopElderMic() {
   const btnEnd = document.getElementById("btnEnd");
   const btnToggleRecord = document.getElementById("btnToggleRecord");
   const joinDual = document.getElementById("joinDual");
+  const capL = document.getElementById("capL");
+  const capR = document.getElementById("capR");
+  const micBanner = document.getElementById("micBanner");
+  const btnEnableMic = document.getElementById("btnEnableMic");
 
   function renderJoinLinks() {
     const base = `${location.protocol}//${location.host}`;
@@ -277,84 +158,84 @@ function stopElderMic() {
   function setMode(newMode) {
     mode = newMode;
     elModeBadge.textContent = (mode === "view") ? "查看模式" : "实时模式";
-
-    // 老人端：实时模式自动采集；查看模式停止采集（避免翻历史时占用麦）
-    if (mode === "live") {
-      startElderMicAuto();
-    } else {
-      stopElderMic();
-    }
-
-    // In view mode: disable composer
     const disabled = (mode === "view");
     elInput.disabled = disabled;
     btnSend.disabled = disabled;
     btnToggleRecord.disabled = disabled;
     btnEnd.disabled = disabled;
     elInput.placeholder = disabled ? "当前为查看模式，点击“开启新讨论”返回实时模式" : "老人说一句…（回车发送）";
+    if (mode === "view") {
+      stopElderMic();
+    } else {
+      ensureElderMic();
+    }
   }
 
   function setPhase(p) {
+    if (!phases.includes(p)) p = "discussion";
     phase = p;
     setQS("phase", p);
     document.querySelectorAll(".pill").forEach(x => x.classList.toggle("active", x.dataset.phase === p));
-    // rerender from cache by filtering? simplest: reload view/live
-    if (mode === "view") loadSessionView(sessionId);
+
+    // clear partial captions when leaving discussion
+    if (phase !== "discussion") {
+      capL.textContent = "说话人1：…";
+      capR.textContent = "…：说话人2";
+    }
+
+    // tell backend current phase (for elder channel routing + client gate)
+    if (mode === "live" && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({type:"set_phase", phase}));
+    }
+
+    // render this phase buffer
+    renderPhase(phase);
   }
 
   document.querySelectorAll(".pill").forEach(p => p.addEventListener("click", () => setPhase(p.dataset.phase)));
 
-  
-function shouldAutoScroll() {
-  // auto-scroll only when user is near bottom
-  const threshold = 80;
-  return (elChat.scrollHeight - (elChat.scrollTop + elChat.clientHeight)) < threshold;
-}
+  function clearChat() { elChat.innerHTML = ""; }
 
-function isNoiseText(t) {
-  const s = String(t || "").trim();
-  if (!s) return true;
-  const low = s.toLowerCase().replaceAll(" ", "");
-  const patterns = ["字幕by", "subtitlesby", "索兰娅", "solanya", "solania"];
-  for (const p of patterns) {
-    if (low.includes(p.replaceAll(" ", "").toLowerCase())) return true;
-  }
-  // drop if all punct/symbol
-  const allPunct = [...s].every(ch => {
-    const isCJK = ch >= "\u4e00" && ch <= "\u9fff";
-    const isNum = /[0-9]/.test(ch);
-    const isAlpha = /[a-zA-Z]/.test(ch);
-    return !(isCJK || isNum || isAlpha);
-  });
-  if (allPunct) return true;
-  if (s.length < 2) return true;
-  return false;
-}
-
-function addBubble(speaker, content, side, extraMeta="") {
-  if (isNoiseText(content)) return;
-
-  const auto = shouldAutoScroll();
-
-  const wrap = document.createElement("div");
-  wrap.className = "msg " + (side === "right" ? "right" : "left");
-  const bubble = document.createElement("div");
-  bubble.className = "bubble " + (side === "right" ? "user" : "other");
-  bubble.innerHTML = `<div class="meta"><b>${speaker || ""}</b> ${extraMeta}</div>${escapeHtml(content)}`;
-  wrap.appendChild(bubble);
-  elChat.appendChild(wrap);
-
-  if (auto) elChat.scrollTop = elChat.scrollHeight;
-}
-
-  function escapeHtml(str) {
-    return String(str).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
-      .replaceAll('"',"&quot;").replaceAll("'","&#039;").replaceAll("\n","<br/>");
+  function addBubbleToDOM(speaker, content, side, ts) {
+    const wrap = document.createElement("div");
+    wrap.className = "msg " + (side === "right" ? "right" : "left");
+    const bubble = document.createElement("div");
+    bubble.className = "bubble " + (side === "right" ? "user" : "other");
+    bubble.innerHTML = `<div class="meta"><b>${escapeHtml(speaker || "")}</b><span class="time muted">${escapeHtml(ts||"")}</span></div>${escapeHtml(content)}`;
+    wrap.appendChild(bubble);
+    elChat.appendChild(wrap);
   }
 
-  function clearChat() { elChat.innerHTML = ""; lastMsgId = 0; }
+  function renderPhase(p) {
+    clearChat();
+    const arr = messagesByPhase[p] || [];
+    arr.forEach(m => {
+      const side = (m.speaker === "老人") ? "right" : "left";
+      addBubbleToDOM(m.speaker, m.content, side, fmtTime(m.ts||0));
+    });
+    // scroll bottom
+    elChat.scrollTop = elChat.scrollHeight;
+  }
 
-  // ---------- WebSocket (robust reconnect) ----------
+  function appendMessage(m) {
+    // buffer
+    const p = phases.includes(m.phase) ? m.phase : "discussion";
+    messagesByPhase[p].push(m);
+    lastMsgId = Math.max(lastMsgId, m.id || 0);
+
+    // render only if matches current phase
+    if (p !== phase) return;
+
+    // smart autoscroll (only if user is near bottom)
+    const nearBottom = elChat.scrollTop + elChat.clientHeight >= elChat.scrollHeight - 120;
+
+    const side = (m.speaker === "老人") ? "right" : "left";
+    addBubbleToDOM(m.speaker, m.content, side, fmtTime(m.ts||0));
+
+    if (nearBottom) elChat.scrollTop = elChat.scrollHeight;
+  }
+
+  // ---------- WebSocket (master) ----------
   function wsUrl() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     return `${proto}://${location.host}/ws/master?session_id=${encodeURIComponent(sessionId)}`;
@@ -368,9 +249,12 @@ function addBubble(speaker, content, side, extraMeta="") {
 
     ws.onopen = () => {
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-      // keepalive pong handler
-      // also refresh join links
       renderJoinLinks();
+      // sync backend phase immediately
+      ws.send(JSON.stringify({type:"set_phase", phase}));
+      // sync record gate too
+      ws.send(JSON.stringify({type:"set_active", active: recordActive}));
+      ensureElderMic();
     };
 
     ws.onmessage = (ev) => {
@@ -381,48 +265,42 @@ function addBubble(speaker, content, side, extraMeta="") {
         return;
       }
 
-      
-if (data.type === "names") {
-  // optional: show in UI later
-  if (data.E) {
-    // keep as "老人" default; could extend UI if needed
-  }
-  return;
-}
+      if (data.type === "phase") {
+        // server confirmed phase; trust local UI as source of truth, ignore unless mismatch
+        return;
+      }
 
       if (data.type === "asr_partial") {
+        // Only show client partial captions in discussion
+        if ((data.phase || "discussion") !== "discussion") return;
+        if (phase !== "discussion") return;
         const ch = (data.channel || "").toUpperCase();
         const t = data.content || "";
-        if (ch === "L") document.getElementById("capL").textContent = `${data.speaker || "说话人1"}：${t}`;
-        if (ch === "R") document.getElementById("capR").textContent = `${data.speaker || "说话人2"}：${t}`;
+        if (ch === "L") capL.textContent = `${data.speaker || "说话人1"}：${t}`;
+        if (ch === "R") capR.textContent = `${t}：${data.speaker || "说话人2"}`;
         return;
       }
 
       if (data.type === "text") {
-        if (data.phase && data.phase !== phase) return; // show only current tab
-        lastMsgId = Math.max(lastMsgId, data.id || 0);
-        const side = (data.speaker === "老人") ? "right" : "left";
-        addBubble(data.speaker, data.content, side, `<span class="muted">${fmtTime(data.ts || 0)}</span>`);
+        // phase-isolated message
+        appendMessage({
+          id: data.id || 0,
+          phase: data.phase || "discussion",
+          speaker: data.speaker || "",
+          content: data.content || "",
+          ts: data.ts || Math.floor(Date.now()/1000),
+        });
         return;
       }
 
-      if (data.type === "status") {
-        // ignore for master
+      if (data.type === "volume") {
+        // We only use elder volume for the wave. Some servers may send L/R too.
+        const ch = (data.channel || "E").toUpperCase();
+        if (ch !== "E") return;
+        const v = data.value || 0;
+        elWave.style.transform = `scaleY(${0.35 + v * 2})`;
         return;
       }
-
-      
-if (data.type === "volume") {
-  // 服务器推送音量（含 channel/value）
-  const ch = String(data.channel || "").toUpperCase();
-  const v = data.value || 0;
-  // 老人端的显化优先用 E 通道；如果后端没发 E，也允许任意通道驱动
-  if (!ch || ch === "E") {
-    elWave.style.transform = `scaleY(${0.35 + v * 2.2})`;
-  }
-  return;
-}
-
     };
 
     ws.onclose = () => scheduleReconnect();
@@ -447,10 +325,16 @@ if (data.type === "volume") {
       const div = document.createElement("div");
       div.className = "session-item" + (s.session_id === sessionId && mode==="view" ? " active" : "");
       const title = s.summary_title || "（未命名讨论）";
-      div.innerHTML = `<div><b>${escapeHtml(title)}</b></div><div class="muted">${fmtTime(s.created_at)}${s.ended_at ? " · 已存档" : ""}</div>`;
+      div.innerHTML = `<div><b>${escapeHtml(title)}</b></div><div class="muted">${escapeHtml(fmtTime(s.created_at))}${s.ended_at ? " · 已存档" : ""}</div>`;
       div.onclick = () => openHistory(s.session_id);
       elList.appendChild(div);
     });
+  }
+
+  function resetPhaseBuffers() {
+    phases.forEach(p => messagesByPhase[p] = []);
+    lastMsgId = 0;
+    renderPhase(phase);
   }
 
   async function createNewSession() {
@@ -459,17 +343,16 @@ if (data.type === "volume") {
     sessionId = s.session_id;
     setQS("session_id", sessionId);
     setMode("live");
-    clearChat();
     renderJoinLinks();
-    await refreshSessions();
+    resetPhaseBuffers();
     connectWS();
-    startElderMicAuto();
+    // default phase
+    setPhase("discussion");
   }
 
   async function endSession() {
     await api(`/api/sessions/${encodeURIComponent(sessionId)}/end`, {method:"POST", body: JSON.stringify({})});
     await refreshSessions();
-    // keep live; user can start a new one explicitly
     alert("已存档到历史会话 ✅");
   }
 
@@ -485,33 +368,36 @@ if (data.type === "volume") {
   }
 
   async function loadSessionView(sid) {
-    clearChat();
+    resetPhaseBuffers();
     const res = await api(`/api/sessions/${encodeURIComponent(sid)}`);
     const sess = await res.json();
-    const msgs = (sess.messages || []).filter(m => m.phase === phase);
-
-    msgs.forEach(m => {
-      const side = (m.speaker === "老人") ? "right" : "left";
-      addBubble(m.speaker || "", m.content || "", side, `<span class="muted">${fmtTime(m.ts || 0)}</span>`);
+    (sess.messages || []).forEach(m => {
+      const p = phases.includes(m.phase) ? m.phase : "discussion";
+      messagesByPhase[p].push({
+        id: m.id || 0,
+        phase: p,
+        speaker: m.speaker || "",
+        content: m.content || "",
+        ts: m.ts || 0
+      });
       lastMsgId = Math.max(lastMsgId, m.id || 0);
     });
+    renderPhase(phase);
   }
 
-  // ---------- send ----------
+  // ---------- send typed text ----------
   async function sendText() {
     if (mode !== "live") return;
     const text = elInput.value.trim();
     if (!text) return;
     elInput.value = "";
-    // push via WS for lowest latency
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({type:"text", phase, speaker:"老人", content:text}));
     } else {
-      // fallback to REST (still will appear in view later)
       await api(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {method:"POST", body: JSON.stringify({
         phase, role:"user", speaker:"老人", content:text
       })});
-      addBubble("老人", text, "right", `<span class="muted">${fmtTime(Math.floor(Date.now()/1000))}</span>`);
+      appendMessage({id:0, phase, speaker:"老人", content:text, ts: Math.floor(Date.now()/1000)});
     }
   }
 
@@ -529,9 +415,142 @@ if (data.type === "volume") {
     }
   }
 
+  // ---------- Elder mic capture -> ws/client?channel=E ----------
+  function wsMicUrl() {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    return `${proto}://${location.host}/ws/client?session_id=${encodeURIComponent(sessionId)}&channel=E`;
+  }
+
+  function floatToPCM16(float32) {
+    const out = new Int16Array(float32.length);
+    for (let i=0;i<float32.length;i++) {
+      let s = Math.max(-1, Math.min(1, float32[i]));
+      out[i] = s < 0 ? s * 32768 : s * 32767;
+    }
+    return out;
+  }
+
+  function downsampleBuffer(buffer, inRate, outRate) {
+    if (outRate === inRate) return buffer;
+    const ratio = inRate / outRate;
+    const newLen = Math.round(buffer.length / ratio);
+    const result = new Float32Array(newLen);
+    let offsetResult = 0;
+    let offsetBuffer = 0;
+    while (offsetResult < result.length) {
+      const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+      let sum = 0, count = 0;
+      for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+        sum += buffer[i]; count++;
+      }
+      result[offsetResult] = sum / Math.max(1, count);
+      offsetResult++; offsetBuffer = nextOffsetBuffer;
+    }
+    return result;
+  }
+
+  function packFrame(channelId, seq, pcm16) {
+    const payload = new Uint8Array(pcm16.buffer);
+    const buf = new ArrayBuffer(1 + 4 + payload.length);
+    const view = new DataView(buf);
+    view.setUint8(0, channelId);         // 2 => E
+    view.setUint32(1, seq, true);
+    new Uint8Array(buf, 5).set(payload);
+    return buf;
+  }
+
+  function rms(buf){
+    let s=0;
+    for(let i=0;i<buf.length;i++){ const x=buf[i]; s+=x*x; }
+    return Math.sqrt(s / Math.max(1, buf.length));
+  }
+
+  async function startElderMic() {
+    if (!sessionId) return;
+
+    // connect wsMic
+    if (!wsMic || wsMic.readyState !== WebSocket.OPEN) {
+      wsMic = new WebSocket(wsMicUrl());
+      wsMic.binaryType = "arraybuffer";
+      wsMic.onmessage = (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          if (data.type === "ping") wsMic.send(JSON.stringify({type:"pong", ts:data.ts}));
+        } catch(e){}
+      };
+      await new Promise((res) => { wsMic.onopen = res; });
+    }
+
+    mediaStreamE = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation:false, noiseSuppression:false, autoGainControl:false }
+    });
+
+    audioCtxE = new (window.AudioContext || window.webkitAudioContext)();
+    const inRate = audioCtxE.sampleRate;
+
+    sourceNodeE = audioCtxE.createMediaStreamSource(mediaStreamE);
+    processorE = audioCtxE.createScriptProcessor(4096, 1, 1);
+
+    processorE.onaudioprocess = (e) => {
+      const ch = e.inputBuffer.getChannelData(0);
+
+      // local visualize
+      const v = Math.min(1.0, rms(ch) * 8.0);
+      elWave.style.transform = `scaleY(${0.35 + v * 2})`;
+
+      // send frames
+      if (!wsMic || wsMic.readyState !== WebSocket.OPEN) return;
+
+      const ds = downsampleBuffer(ch, inRate, targetRateE);
+      const frameSize = 320; // 20ms @16k
+      for (let i=0;i+frameSize<=ds.length;i+=frameSize) {
+        const frame = ds.subarray(i, i+frameSize);
+        const pcm = floatToPCM16(frame);
+        const buf = packFrame(2, (seqE++ >>> 0), pcm);
+        try { wsMic.send(buf); } catch(err) {}
+      }
+    };
+
+    sourceNodeE.connect(processorE);
+    processorE.connect(audioCtxE.destination);
+
+    micReady = true;
+    micBanner.style.display = "none";
+  }
+
+  function stopElderMic() {
+    micReady = false;
+    try { if (processorE) processorE.disconnect(); } catch(e){}
+    try { if (sourceNodeE) sourceNodeE.disconnect(); } catch(e){}
+    try { if (mediaStreamE) mediaStreamE.getTracks().forEach(t => t.stop()); } catch(e){}
+    try { if (audioCtxE) audioCtxE.close(); } catch(e){}
+    processorE = null; sourceNodeE = null; mediaStreamE = null; audioCtxE = null;
+
+    try { if (wsMic) wsMic.close(); } catch(e){}
+    wsMic = null;
+  }
+
+  async function ensureElderMic() {
+    if (mode !== "live") return;
+    if (micReady) return;
+    try {
+      await startElderMic();
+    } catch (err) {
+      // Most common reason: needs user gesture or permission denied
+      micBanner.style.display = "block";
+    }
+  }
+
+  btnEnableMic.onclick = async () => {
+    try {
+      await startElderMic();
+    } catch (err) {
+      alert("无法启用麦克风：" + err);
+    }
+  };
+
   // ---------- boot ----------
   (async function boot(){
-    // ensure session
     if (!sessionId) {
       await createNewSession();
     } else {
@@ -539,7 +558,7 @@ if (data.type === "volume") {
       setMode("live");
       await refreshSessions();
       connectWS();
-      startElderMicAuto();
+      ensureElderMic();
     }
     setPhase(phase);
   })();

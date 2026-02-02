@@ -9,6 +9,8 @@ import sqlite3
 import threading
 import time
 import uuid
+import re
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -186,7 +188,9 @@ def db_get_messages_after(session_id: str, after_id: int) -> List[dict]:
 class RoomState:
     masters: Set[WebSocket]
     clients: Set[WebSocket]
-    names: Dict[str, str]   # channel -> name ("L"/"R")
+    names: Dict[str, str]   # channel -> name ("L"/"R"/"E")
+    active_phase: str       # preparation | discussion | review
+    client_record_active: bool
 
 rooms: Dict[str, RoomState] = {}
 
@@ -202,7 +206,6 @@ class AudioStreamState:
     last_voice_ts: float
     last_partial_text: str
 
-    last_volume_ts: float
 def make_audio_state() -> AudioStreamState:
     v = webrtcvad.Vad(2) if webrtcvad else None
     return AudioStreamState(
@@ -213,8 +216,7 @@ def make_audio_state() -> AudioStreamState:
         silence_run=0,
         last_partial_ts=0.0,
         last_voice_ts=0.0,
-        last_partial_text="",
-        last_volume_ts=0.0
+        last_partial_text=""
     )
 
 
@@ -234,47 +236,15 @@ RMS_MIN = float(os.environ.get("ASR_RMS_MIN", "0.005"))
 START_SPEECH_FRAMES = int(os.environ.get("ASR_START_SPEECH_FRAMES", "5"))
 END_SILENCE_FRAMES = int(os.environ.get("ASR_END_SILENCE_FRAMES", "12"))
 
+# Extra gating + hallucination suppression (final is stricter than partial)
+RMS_MIN_FINAL = float(os.environ.get("ASR_RMS_MIN_FINAL", "0.010"))
+MIN_TEXT_CHARS_PARTIAL = int(os.environ.get("ASR_MIN_TEXT_CHARS_PARTIAL", "2"))
+MIN_TEXT_CHARS_FINAL = int(os.environ.get("ASR_MIN_TEXT_CHARS_FINAL", "3"))
+DEDUP_WINDOW_SEC = float(os.environ.get("ASR_DEDUP_WINDOW_SEC", "12"))
 
+# key=(session_id, phase, channel) -> (text, ts)
+_last_text_cache: dict[tuple[str, str, str], tuple[str, float]] = {}
 
-# Extra gating / cleanup to suppress tiny-noise hallucinations like "字幕by..."
-MIN_TEXT_CHARS_FINAL = int(os.environ.get("ASR_MIN_TEXT_CHARS_FINAL", "2"))
-MIN_TEXT_CHARS_PARTIAL = int(os.environ.get("ASR_MIN_TEXT_CHARS_PARTIAL", "1"))
-RMS_MIN_FINAL = float(os.environ.get("ASR_RMS_MIN_FINAL", str(RMS_MIN)))
-VOLUME_INTERVAL_SEC = float(os.environ.get("VOLUME_INTERVAL_SEC", "0.08"))  # ~12.5 FPS
-VOLUME_GAIN = float(os.environ.get("VOLUME_GAIN", "8.0"))
-
-NOISE_PATTERNS = [
-    "字幕by", "字幕 by", "subtitles by", "字幕by索", "索兰娅", "solanya", "solania"
-]
-
-def _is_all_punct(s: str) -> bool:
-    s = s.strip()
-    if not s:
-        return True
-    return all(
-        (not ch.isalnum())
-        and (ch not in "一二三四五六七八九十零")
-        and (not ("\u4e00" <= ch <= "\u9fff"))
-        for ch in s
-    )
-
-def clean_and_filter_text(text: str, is_partial: bool = False) -> str:
-    # Return cleaned text if usable, else '' to drop.
-    if not text:
-        return ""
-    t = str(text).strip()
-    if not t:
-        return ""
-    low = t.lower().replace(" ", "")
-    for p in NOISE_PATTERNS:
-        if p.replace(" ", "").lower() in low:
-            return ""
-    if _is_all_punct(t):
-        return ""
-    min_len = MIN_TEXT_CHARS_PARTIAL if is_partial else MIN_TEXT_CHARS_FINAL
-    if len(t) < min_len:
-        return ""
-    return t
 
 # ---------------------------
 # Streaming ASR (GPU)
@@ -339,6 +309,70 @@ def transcribe_text(audio_f32: np.ndarray) -> str:
     text = ''.join([s.text for s in segments]).strip()
     return text
 
+# ---------------------------
+# Hallucination / noise suppression
+# ---------------------------
+_NOISE_PATTERNS = [
+    r"字幕\s*by", r"subtitles?\s*by", r"字幕组", r"字幕君",
+    r"索兰娅", r"solanya", r"索兰雅",
+    r"感谢观看", r"谢谢观看", r"点赞", r"关注", r"订阅",
+    r"未经许可", r"搬运", r"转载", r"翻译", r"中文字幕",
+]
+_noise_re = re.compile("|".join(_NOISE_PATTERNS), re.IGNORECASE)
+
+def _normalize_text(t: str) -> str:
+    t = (t or "").strip()
+    t = re.sub(r"\s+", "", t)
+    return t
+
+def should_keep_asr_text(
+    text: str,
+    *,
+    is_final: bool,
+    rms: float,
+    duration_sec: float,
+) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    # Energy gate: final must be stricter (short noise often triggers template hallucinations)
+    if is_final:
+        if rms < RMS_MIN_FINAL:
+            return False
+    else:
+        if rms < RMS_MIN:
+            return False
+
+    # Duration gate
+    if is_final and duration_sec < MIN_FINAL_SEC:
+        return False
+    if (not is_final) and duration_sec < MIN_PARTIAL_SEC:
+        return False
+
+    # Text length gate
+    nt = _normalize_text(t)
+    if is_final and len(nt) < MIN_TEXT_CHARS_FINAL:
+        return False
+    if (not is_final) and len(nt) < MIN_TEXT_CHARS_PARTIAL:
+        return False
+
+    # Pure punctuation / symbols
+    if re.fullmatch(r"[\W_]+", t):
+        return False
+
+    # Blacklist templates
+    if _noise_re.search(t):
+        return False
+
+    # Repetition ratio (e.g., 啊啊啊啊啊 / ～～～～)
+    if len(nt) >= 6:
+        most = max(nt.count(ch) for ch in set(nt))
+        if most / max(1, len(nt)) > 0.75:
+            return False
+
+    return True
+
 
 async def ws_send_safe(ws: WebSocket, obj: dict) -> None:
     try:
@@ -364,7 +398,13 @@ async def broadcast_to_clients(session_id: str, obj: dict) -> None:
 def get_or_create_room(session_id: str) -> RoomState:
     with rooms_lock:
         if session_id not in rooms:
-            rooms[session_id] = RoomState(masters=set(), clients=set(), names={"L": "说话人1", "R": "说话人2", "E": "老人"})
+            rooms[session_id] = RoomState(
+                masters=set(),
+                clients=set(),
+                names={"L": "说话人1", "R": "说话人2", "E": "老人"},
+                active_phase="discussion",
+                client_record_active=True,
+            )
         return rooms[session_id]
 
 def remove_ws(session_id: str, ws: WebSocket) -> None:
@@ -485,7 +525,7 @@ async def ws_master(ws: WebSocket, session_id: str = Query(...)):
 
     # notify master of current names and default active status
     await ws_send_safe(ws, {"type": "names", "L": room.names.get("L"), "R": room.names.get("R"), "E": room.names.get("E")})
-    await ws_send_safe(ws, {"type": "status", "active": True, "session_id": session_id})
+    await ws_send_safe(ws, {"type": "status", "active": room.client_record_active, "phase": room.active_phase, "session_id": session_id})
 
     last_ping = time.time()
 
@@ -516,8 +556,24 @@ async def ws_master(ws: WebSocket, session_id: str = Query(...)):
             # master can toggle client recording
             if data.get("type") == "set_active":
                 active = bool(data.get("active"))
-                await broadcast_to_clients(session_id, {"type": "status", "active": active})
-                await broadcast_to_masters(session_id, {"type": "status", "active": active, "session_id": session_id})
+                with rooms_lock:
+                    room.client_record_active = active
+                # Tell clients & masters. Clients should only stream during discussion.
+                await broadcast_to_clients(session_id, {"type": "status", "active": active, "phase": room.active_phase})
+                await broadcast_to_masters(session_id, {"type": "status", "active": active, "phase": room.active_phase, "session_id": session_id})
+                continue
+
+            if data.get("type") == "set_phase":
+                p = str(data.get("phase") or "discussion")
+                if p not in ("preparation", "discussion", "review"):
+                    p = "discussion"
+                with rooms_lock:
+                    room.active_phase = p
+                # Inform both ends. Clients are expected to stream only during discussion.
+                await broadcast_to_masters(session_id, {"type": "phase", "phase": p})
+                await broadcast_to_clients(session_id, {"type": "phase", "phase": p})
+                # Also re-send status to clients (record gate + phase)
+                await broadcast_to_clients(session_id, {"type": "status", "active": room.client_record_active, "phase": p})
                 continue
 
             if data.get("type") == "names":
@@ -526,10 +582,6 @@ async def ws_master(ws: WebSocket, session_id: str = Query(...)):
                         room.names["L"] = str(data["L"])
                     if "R" in data:
                         room.names["R"] = str(data["R"])
-                    if "E" in data:
-                        room.names["E"] = str(data["E"])
-                    if "E" in data:
-                        room.names["E"] = str(data["E"])
                 await broadcast_to_masters(session_id, {"type": "names", "L": room.names.get("L"), "R": room.names.get("R"), "E": room.names.get("E")})
                 await broadcast_to_clients(session_id, {"type": "names", "L": room.names.get("L"), "R": room.names.get("R"), "E": room.names.get("E")})
                 continue
@@ -575,7 +627,7 @@ async def ws_client(ws: WebSocket, session_id: str = Query(...), channel: str | 
         room.clients.add(ws)
 
     # send current status and names
-    await ws_send_safe(ws, {"type": "status", "active": True})
+    await ws_send_safe(ws, {"type": "status", "active": room.client_record_active, "phase": room.active_phase})
     await ws_send_safe(ws, {"type": "names", "L": room.names.get("L"), "R": room.names.get("R"), "E": room.names.get("E")})
 
     last_ping = time.time()
@@ -632,6 +684,7 @@ async def ws_client(ws: WebSocket, session_id: str = Query(...), channel: str | 
                     if len(raw) < 5:
                         continue
                     ch_id = raw[0]
+                    ch = "L"
                     if ch_id == 0:
                         ch = "L"
                     elif ch_id == 1:
@@ -639,7 +692,7 @@ async def ws_client(ws: WebSocket, session_id: str = Query(...), channel: str | 
                     elif ch_id == 2:
                         ch = "E"
                     else:
-                        continue
+                        ch = "L"
                     seq = int.from_bytes(raw[1:5], "little", signed=False)
                     pcm = raw[5:]
                 else:
@@ -651,25 +704,35 @@ async def ws_client(ws: WebSocket, session_id: str = Query(...), channel: str | 
                     except Exception:
                         continue
 
+                # Gate client audio: only accept L/R during discussion and when authorized
+                if ch in ("L", "R"):
+                    if (room.active_phase != "discussion") or (not room.client_record_active):
+                        continue
+                # Elder channel (E) is always accepted (for all phases)
+
                 last_seq[ch] = seq
                 rx_frames[ch] += 1
                 if rx_frames[ch] in (1, 50, 200):
                     logger.info(f"[ws_client] rx audio frame ch={ch} seq={seq} bytes={len(pcm)} frames={rx_frames[ch]}")
                 st = audio_states[ch]
                 now = time.time()
+                phase_now = "discussion" if ch in ("L","R") else room.active_phase
 
                 frame_f32 = pcm16_bytes_to_float32(pcm)
-                # --- volume broadcast (throttled) ---
-                if frame_f32.size:
-                    rms_frame = float(np.sqrt(np.mean(np.square(frame_f32))))
-                else:
-                    rms_frame = 0.0
-                v = min(1.0, rms_frame * VOLUME_GAIN)
-                if (now - st.last_volume_ts) >= VOLUME_INTERVAL_SEC:
-                    st.last_volume_ts = now
-                    await broadcast_to_masters(session_id, {"type": "volume", "channel": ch, "value": v})
-                    await broadcast_to_clients(session_id, {"type": "volume", "channel": ch, "value": v})
 
+                # Volume (RMS) for visualization
+                try:
+                    rms = float(np.sqrt(np.mean(np.square(frame_f32)))) if frame_f32.size else 0.0
+                except Exception:
+                    rms = 0.0
+                v = min(1.0, rms * 8.0)
+                # Send volume to masters for elder wave; and to clients for local debug/compat
+                if ch == "E":
+                    await broadcast_to_masters(session_id, {"type": "volume", "channel": "E", "value": v, "phase": phase_now})
+                elif ch in ("L","R"):
+                    # only during discussion, already gated above
+                    await broadcast_to_masters(session_id, {"type": "volume", "channel": ch, "value": v, "phase": phase_now})
+                    await broadcast_to_clients(session_id, {"type": "volume", "channel": ch, "value": v, "phase": phase_now})
 
                 speech_frame = True
                 if st.vad is not None:
@@ -727,13 +790,17 @@ async def ws_client(ws: WebSocket, session_id: str = Query(...), channel: str | 
                                     logger.exception(f"ASR partial failed for ch={ch}. Check CUDA/cuDNN/cublas or use ASR_DEVICE=cpu.")
                                     asr_error_reported[ch] = True
                                 text = ""
-                            text = clean_and_filter_text((text or "").strip(), is_partial=True)
-                            if text and text != st.last_partial_text:
+                            text = (text or "").strip()
+                        duration_sec = float(audio_win.shape[0]) / 16000.0
+                        if not should_keep_asr_text(text, is_final=False, rms=rms, duration_sec=duration_sec):
+                            text = ""
+                        if text and text != st.last_partial_text:
+
                                 st.last_partial_text = text
-                                speaker = room.names.get(ch) or ("说话人1" if ch == "L" else ("说话人2" if ch == "R" else "老人"))
+                                speaker = room.names.get(ch) or ("说话人1" if ch == "L" else "说话人2")
                                 await broadcast_to_masters(session_id, {
                                     "type": "asr_partial",
-                                    "phase": "discussion",
+                                    "phase": phase_now,
                                     "speaker": speaker,
                                     "channel": ch,
                                     "content": text,
@@ -751,21 +818,25 @@ async def ws_client(ws: WebSocket, session_id: str = Query(...), channel: str | 
                                 logger.exception(f"ASR final failed for ch={ch}. Check CUDA/cuDNN/cublas or use ASR_DEVICE=cpu.")
                                 asr_error_reported[ch] = True
                             final_text = ""
-                        final_text = clean_and_filter_text((final_text or "").strip(), is_partial=False)
+                        final_text = (final_text or "").strip()
 
-                        rms_final = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
-                        if rms_final < RMS_MIN_FINAL:
-                            final_text = ""
-
-                        if final_text:
-                            speaker = room.names.get(ch) or ("说话人1" if ch == "L" else ("说话人2" if ch == "R" else "老人"))
+                    # final gating + hallucination suppression + short-window de-dup
+                    rms_final = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
+                    duration_sec = float(audio.shape[0]) / 16000.0
+                    if final_text and should_keep_asr_text(final_text, is_final=True, rms=rms_final, duration_sec=duration_sec):
+                        key = (session_id, phase_now, ch)
+                        now_ts = time.time()
+                        last = _last_text_cache.get(key)
+                        if not (last and last[0] == final_text and (now_ts - last[1]) < DEDUP_WINDOW_SEC):
+                            _last_text_cache[key] = (final_text, now_ts)
+                            speaker = room.names.get(ch) or ("说话人1" if ch == "L" else "说话人2")
                             mid = db_add_message(
-                                session_id, "discussion", role="user", speaker=speaker,
+                                session_id, phase_now, role="user", speaker=speaker,
                                 content=final_text, refined=None,
-                                extra={"from": ("elder_mic" if ch=="E" else "client_dual"), "channel": ch, "seq": last_seq.get(ch, 0)}
+                                extra={"from": "client_dual", "channel": ch, "seq": last_seq.get(ch, 0)}
                             )
                             await broadcast_to_masters(session_id, {
-                                "type": "text", "id": mid, "phase": "discussion",
+                                "type": "text", "id": mid, "phase": phase_now,
                                 "speaker": speaker, "content": final_text, "ts": int(time.time())
                             })
 
@@ -784,13 +855,25 @@ async def ws_client(ws: WebSocket, session_id: str = Query(...), channel: str | 
 
 # Backward compatible: old client sends {speaker, content} or {type:"transcript"...}
             if data.get("type") in (None, "", "transcript"):
+                # If this websocket represents a采集端 client, only allow during discussion & when authorized
+                if channel in ("L", "R", "DUAL"):
+                    if (room.active_phase != "discussion") or (not room.client_record_active):
+                        continue
+                    phase = "discussion"
+                else:
+                    # Elder (E) or others
+                    phase = str(data.get("phase") or room.active_phase)
+                    if phase not in ("preparation", "discussion", "review"):
+                        phase = room.active_phase
+
                 speaker = (
                     data.get("speaker")
-                    or (room.names.get(channel) if channel in ("L", "R") else None)
+                    or (room.names.get(channel) if channel in ("L", "R", "E") else None)
                     or ("说话人" + (channel if channel != "DUAL" else ""))
                 )
-                content = data.get("content", "")
-                phase = data.get("phase", "discussion")
+                content = str(data.get("content") or "").strip()
+                if not content:
+                    continue
 
                 mid = db_add_message(
                     session_id, phase, role="user", speaker=speaker, content=content,
