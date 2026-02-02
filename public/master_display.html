@@ -15,8 +15,8 @@
     .row { display:flex; gap:10px; }
     .pill { padding:6px 10px; border-radius:999px; background:#E2E8F0; cursor:pointer; user-select:none; font-size:14px; }
     .pill.active { background:#A78BFA; color:#fff; }
-    .card { background:#fff; border:1px solid #E2E8F0; border-radius:16px; box-shadow: 0 4px 10px -6px rgba(0,0,0,.12); }
-    #chat { flex:1; padding:16px; overflow:auto; }
+    .card { background:#fff; border:1px solid #E2E8F0; border-radius:16px; box-shadow: 0 4px 10px -6px rgba(0,0,0,.12); min-height:0; }
+    #chat { flex:1; padding:16px; overflow:auto; min-height:0; }
     .msg { display:flex; margin:10px 0; }
     .msg.right { justify-content:flex-end; }
     .bubble { max-width:75%; padding:10px 12px; border-radius:14px; line-height:1.5; font-size:15px; }
@@ -77,7 +77,7 @@
       </div>
     </section>
 
-    <div class="muted">🎙️ 您的声音显化（示意：可接入真实音量）</div>
+    <div class="muted">🎙️ 老人端麦克风（实时音量 + 自动转写）</div>
     <div class="wave-box card"><div id="wave" class="wave-bar"></div></div>
   </main>
 
@@ -106,6 +106,158 @@
   let ws = null;
   let reconnectTimer = null;
 
+let elderAudioWS = null;
+let elderReconnectTimer = null;
+let elderAudioCtx = null;
+let elderMediaStream = null;
+let elderSource = null;
+let elderProcessor = null;
+let elderSeq = 0;
+const ELDER_TARGET_RATE = 16000;
+
+function elderWsUrl() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  return `${proto}://${location.host}/ws/client?session_id=${encodeURIComponent(sessionId)}&channel=E`;
+}
+
+function connectElderAudioWS() {
+  if (mode !== "live") return;
+  if (!sessionId) return;
+  if (elderAudioWS && (elderAudioWS.readyState === WebSocket.OPEN || elderAudioWS.readyState === WebSocket.CONNECTING)) return;
+
+  elderAudioWS = new WebSocket(elderWsUrl());
+  elderAudioWS.binaryType = "arraybuffer";
+
+  elderAudioWS.onopen = () => { if (elderReconnectTimer) { clearTimeout(elderReconnectTimer); elderReconnectTimer=null; } };
+  elderAudioWS.onclose = () => scheduleElderReconnect();
+  elderAudioWS.onerror = () => scheduleElderReconnect();
+  elderAudioWS.onmessage = () => {};
+}
+
+function scheduleElderReconnect() {
+  if (mode !== "live") return;
+  if (elderReconnectTimer) return;
+  elderReconnectTimer = setTimeout(() => {
+    elderReconnectTimer = null;
+    connectElderAudioWS();
+  }, 1200);
+}
+
+function floatToPCM16(float32) {
+  const out = new Int16Array(float32.length);
+  for (let i=0;i<float32.length;i++) {
+    let s = Math.max(-1, Math.min(1, float32[i]));
+    out[i] = s < 0 ? s * 32768 : s * 32767;
+  }
+  return out;
+}
+
+function downsampleBuffer(buffer, inRate, outRate) {
+  if (outRate === inRate) return buffer;
+  const ratio = inRate / outRate;
+  const newLen = Math.round(buffer.length / ratio);
+  const result = new Float32Array(newLen);
+  let offsetResult = 0;
+  let offsetBuffer = 0;
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+    let sum = 0, count = 0;
+    for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+      sum += buffer[i];
+      count++;
+    }
+    result[offsetResult] = sum / Math.max(1, count);
+    offsetResult++;
+    offsetBuffer = nextOffsetBuffer;
+  }
+  return result;
+}
+
+function packElderFrame(seq, pcm16) {
+  const payload = new Uint8Array(pcm16.buffer);
+  const buf = new ArrayBuffer(1 + 4 + payload.length);
+  const view = new DataView(buf);
+  view.setUint8(0, 2); // elder channel id
+  view.setUint32(1, seq >>> 0, true);
+  new Uint8Array(buf, 5).set(payload);
+  return buf;
+}
+
+function rms(buf){
+  let s=0;
+  for(let i=0;i<buf.length;i++){ const x=buf[i]; s+=x*x; }
+  return Math.sqrt(s / Math.max(1, buf.length));
+}
+
+async function startElderMicAuto() {
+  if (mode !== "live") return;
+  connectElderAudioWS();
+
+  try {
+    if (!elderMediaStream) {
+      elderMediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false }
+      });
+    }
+
+    if (!elderAudioCtx) elderAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const inRate = elderAudioCtx.sampleRate;
+
+    if (elderAudioCtx.state === "suspended") {
+      // show a hint
+      document.querySelector(".muted").textContent = "🎙️ 需要一次点击以启用麦克风（点击页面任意处）";
+    }
+
+    elderSource = elderAudioCtx.createMediaStreamSource(elderMediaStream);
+    elderProcessor = elderAudioCtx.createScriptProcessor(4096, 1, 1);
+
+    elderProcessor.onaudioprocess = (e) => {
+      if (mode !== "live") return;
+      const ch = e.inputBuffer.getChannelData(0);
+
+      // local volume visualize
+      const v = Math.min(1.0, rms(ch) * 8.0);
+      elWave.style.transform = `scaleY(${0.35 + v * 2.2})`;
+
+      if (!elderAudioWS || elderAudioWS.readyState !== WebSocket.OPEN) return;
+
+      const ds = downsampleBuffer(ch, inRate, ELDER_TARGET_RATE);
+
+      const frameSize = 320; // 20ms @16k
+      for (let i=0;i+frameSize<=ds.length;i+=frameSize) {
+        const frame = ds.subarray(i, i+frameSize);
+        const pcm16 = floatToPCM16(frame);
+        const buf = packElderFrame(elderSeq++, pcm16);
+        try { elderAudioWS.send(buf); } catch(e) {}
+      }
+    };
+
+    elderSource.connect(elderProcessor);
+    elderProcessor.connect(elderAudioCtx.destination);
+
+    const resume = async () => {
+      try { if (elderAudioCtx && elderAudioCtx.state === "suspended") await elderAudioCtx.resume(); } catch(e) {}
+      document.querySelector(".muted").textContent = "🎙️ 老人端麦克风（实时音量 + 自动转写）";
+    };
+    document.addEventListener("click", resume, {once:true});
+
+  } catch (err) {
+    console.warn("Elder mic init failed:", err);
+  }
+}
+
+function stopElderMic() {
+  try { if (elderProcessor) elderProcessor.disconnect(); } catch(e){}
+  try { if (elderSource) elderSource.disconnect(); } catch(e){}
+  try { if (elderMediaStream) elderMediaStream.getTracks().forEach(t => t.stop()); } catch(e){}
+  try { if (elderAudioCtx) elderAudioCtx.close(); } catch(e){}
+  elderAudioCtx = null; elderMediaStream=null; elderSource=null; elderProcessor=null;
+  elderSeq = 0;
+  try { if (elderAudioWS) elderAudioWS.close(); } catch(e){}
+  elderAudioWS = null;
+}
+
+
   const elChat = document.getElementById("chat");
   const elInput = document.getElementById("input");
   const elWave = document.getElementById("wave");
@@ -125,6 +277,14 @@
   function setMode(newMode) {
     mode = newMode;
     elModeBadge.textContent = (mode === "view") ? "查看模式" : "实时模式";
+
+    // 老人端：实时模式自动采集；查看模式停止采集（避免翻历史时占用麦）
+    if (mode === "live") {
+      startElderMicAuto();
+    } else {
+      stopElderMic();
+    }
+
     // In view mode: disable composer
     const disabled = (mode === "view");
     elInput.disabled = disabled;
@@ -144,16 +304,48 @@
 
   document.querySelectorAll(".pill").forEach(p => p.addEventListener("click", () => setPhase(p.dataset.phase)));
 
-  function addBubble(speaker, content, side, extraMeta="") {
-    const wrap = document.createElement("div");
-    wrap.className = "msg " + (side === "right" ? "right" : "left");
-    const bubble = document.createElement("div");
-    bubble.className = "bubble " + (side === "right" ? "user" : "other");
-    bubble.innerHTML = `<div class="meta"><b>${speaker || ""}</b> ${extraMeta}</div>${escapeHtml(content)}`;
-    wrap.appendChild(bubble);
-    elChat.appendChild(wrap);
-    elChat.scrollTop = elChat.scrollHeight;
+  
+function shouldAutoScroll() {
+  // auto-scroll only when user is near bottom
+  const threshold = 80;
+  return (elChat.scrollHeight - (elChat.scrollTop + elChat.clientHeight)) < threshold;
+}
+
+function isNoiseText(t) {
+  const s = String(t || "").trim();
+  if (!s) return true;
+  const low = s.toLowerCase().replaceAll(" ", "");
+  const patterns = ["字幕by", "subtitlesby", "索兰娅", "solanya", "solania"];
+  for (const p of patterns) {
+    if (low.includes(p.replaceAll(" ", "").toLowerCase())) return true;
   }
+  // drop if all punct/symbol
+  const allPunct = [...s].every(ch => {
+    const isCJK = ch >= "\u4e00" && ch <= "\u9fff";
+    const isNum = /[0-9]/.test(ch);
+    const isAlpha = /[a-zA-Z]/.test(ch);
+    return !(isCJK || isNum || isAlpha);
+  });
+  if (allPunct) return true;
+  if (s.length < 2) return true;
+  return false;
+}
+
+function addBubble(speaker, content, side, extraMeta="") {
+  if (isNoiseText(content)) return;
+
+  const auto = shouldAutoScroll();
+
+  const wrap = document.createElement("div");
+  wrap.className = "msg " + (side === "right" ? "right" : "left");
+  const bubble = document.createElement("div");
+  bubble.className = "bubble " + (side === "right" ? "user" : "other");
+  bubble.innerHTML = `<div class="meta"><b>${speaker || ""}</b> ${extraMeta}</div>${escapeHtml(content)}`;
+  wrap.appendChild(bubble);
+  elChat.appendChild(wrap);
+
+  if (auto) elChat.scrollTop = elChat.scrollHeight;
+}
 
   function escapeHtml(str) {
     return String(str).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
@@ -189,10 +381,14 @@
         return;
       }
 
-      if (data.type === "names") {
-        // optional: show in UI later
-        return;
-      }
+      
+if (data.type === "names") {
+  // optional: show in UI later
+  if (data.E) {
+    // keep as "老人" default; could extend UI if needed
+  }
+  return;
+}
 
       if (data.type === "asr_partial") {
         const ch = (data.channel || "").toUpperCase();
@@ -215,11 +411,18 @@
         return;
       }
 
-      if (data.type === "volume") {
-        const v = data.value || 0;
-        elWave.style.transform = `scaleY(${0.35 + v * 2})`;
-        return;
-      }
+      
+if (data.type === "volume") {
+  // 服务器推送音量（含 channel/value）
+  const ch = String(data.channel || "").toUpperCase();
+  const v = data.value || 0;
+  // 老人端的显化优先用 E 通道；如果后端没发 E，也允许任意通道驱动
+  if (!ch || ch === "E") {
+    elWave.style.transform = `scaleY(${0.35 + v * 2.2})`;
+  }
+  return;
+}
+
     };
 
     ws.onclose = () => scheduleReconnect();
@@ -260,6 +463,7 @@
     renderJoinLinks();
     await refreshSessions();
     connectWS();
+    startElderMicAuto();
   }
 
   async function endSession() {
@@ -335,6 +539,7 @@
       setMode("live");
       await refreshSessions();
       connectWS();
+      startElderMicAuto();
     }
     setPhase(phase);
   })();

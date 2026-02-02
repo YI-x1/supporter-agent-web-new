@@ -104,11 +104,22 @@
         return;
       }
 
-      if (data.type === "volume") {
-        document.getElementById('waveL').style.transform = `scaleY(${0.2 + (data.L||0) * 2.5})`;
-        document.getElementById('waveR').style.transform = `scaleY(${0.2 + (data.R||0) * 2.5})`;
-        return;
-      }
+      
+if (data.type === "volume") {
+  // 兼容两种格式：
+  // 1) legacy: {L:0.1, R:0.2}
+  // 2) new: {channel:"L"/"R"/"E", value:0.3}
+  if (data.channel) {
+    const ch = String(data.channel).toUpperCase();
+    const v = data.value || 0;
+    if (ch === "L") document.getElementById('waveL').style.transform = `scaleY(${0.2 + v * 2.5})`;
+    if (ch === "R") document.getElementById('waveR').style.transform = `scaleY(${0.2 + v * 2.5})`;
+  } else {
+    document.getElementById('waveL').style.transform = `scaleY(${0.2 + (data.L||0) * 2.5})`;
+    document.getElementById('waveR').style.transform = `scaleY(${0.2 + (data.R||0) * 2.5})`;
+  }
+  return;
+}
 
       if (data.type === "status") {
         isActive = !!data.active;
@@ -229,12 +240,24 @@
       // Demo uses ScriptProcessor (deprecated but simple).
       processor = audioCtx.createScriptProcessor(4096, 2, 2);
 
+      function rms(buf){
+        let s=0;
+        for(let i=0;i<buf.length;i++){ const x=buf[i]; s+=x*x; }
+        return Math.sqrt(s / Math.max(1, buf.length));
+      }
+
       processor.onaudioprocess = (e) => {
         // Respect master control: only send when "active"
         if (!isActive) return;
 
         const chL = e.inputBuffer.getChannelData(0);
         const chR = e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : e.inputBuffer.getChannelData(0);
+
+        // --- local RMS visualize (no server dependency) ---
+        const vL = Math.min(1.0, rms(chL) * 8.0);
+        const vR = Math.min(1.0, rms(chR) * 8.0);
+        document.getElementById('waveL').style.transform = `scaleY(${0.2 + vL * 2.5})`;
+        document.getElementById('waveR').style.transform = `scaleY(${0.2 + vR * 2.5})`;
 
         const dsL = downsampleBuffer(chL, inRate, targetRate);
         const dsR = downsampleBuffer(chR, inRate, targetRate);

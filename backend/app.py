@@ -202,6 +202,7 @@ class AudioStreamState:
     last_voice_ts: float
     last_partial_text: str
 
+    last_volume_ts: float
 def make_audio_state() -> AudioStreamState:
     v = webrtcvad.Vad(2) if webrtcvad else None
     return AudioStreamState(
@@ -212,7 +213,8 @@ def make_audio_state() -> AudioStreamState:
         silence_run=0,
         last_partial_ts=0.0,
         last_voice_ts=0.0,
-        last_partial_text=""
+        last_partial_text="",
+        last_volume_ts=0.0
     )
 
 
@@ -232,6 +234,47 @@ RMS_MIN = float(os.environ.get("ASR_RMS_MIN", "0.005"))
 START_SPEECH_FRAMES = int(os.environ.get("ASR_START_SPEECH_FRAMES", "5"))
 END_SILENCE_FRAMES = int(os.environ.get("ASR_END_SILENCE_FRAMES", "12"))
 
+
+
+# Extra gating / cleanup to suppress tiny-noise hallucinations like "字幕by..."
+MIN_TEXT_CHARS_FINAL = int(os.environ.get("ASR_MIN_TEXT_CHARS_FINAL", "2"))
+MIN_TEXT_CHARS_PARTIAL = int(os.environ.get("ASR_MIN_TEXT_CHARS_PARTIAL", "1"))
+RMS_MIN_FINAL = float(os.environ.get("ASR_RMS_MIN_FINAL", str(RMS_MIN)))
+VOLUME_INTERVAL_SEC = float(os.environ.get("VOLUME_INTERVAL_SEC", "0.08"))  # ~12.5 FPS
+VOLUME_GAIN = float(os.environ.get("VOLUME_GAIN", "8.0"))
+
+NOISE_PATTERNS = [
+    "字幕by", "字幕 by", "subtitles by", "字幕by索", "索兰娅", "solanya", "solania"
+]
+
+def _is_all_punct(s: str) -> bool:
+    s = s.strip()
+    if not s:
+        return True
+    return all(
+        (not ch.isalnum())
+        and (ch not in "一二三四五六七八九十零")
+        and (not ("\u4e00" <= ch <= "\u9fff"))
+        for ch in s
+    )
+
+def clean_and_filter_text(text: str, is_partial: bool = False) -> str:
+    # Return cleaned text if usable, else '' to drop.
+    if not text:
+        return ""
+    t = str(text).strip()
+    if not t:
+        return ""
+    low = t.lower().replace(" ", "")
+    for p in NOISE_PATTERNS:
+        if p.replace(" ", "").lower() in low:
+            return ""
+    if _is_all_punct(t):
+        return ""
+    min_len = MIN_TEXT_CHARS_PARTIAL if is_partial else MIN_TEXT_CHARS_FINAL
+    if len(t) < min_len:
+        return ""
+    return t
 
 # ---------------------------
 # Streaming ASR (GPU)
@@ -321,7 +364,7 @@ async def broadcast_to_clients(session_id: str, obj: dict) -> None:
 def get_or_create_room(session_id: str) -> RoomState:
     with rooms_lock:
         if session_id not in rooms:
-            rooms[session_id] = RoomState(masters=set(), clients=set(), names={"L": "说话人1", "R": "说话人2"})
+            rooms[session_id] = RoomState(masters=set(), clients=set(), names={"L": "说话人1", "R": "说话人2", "E": "老人"})
         return rooms[session_id]
 
 def remove_ws(session_id: str, ws: WebSocket) -> None:
@@ -441,7 +484,7 @@ async def ws_master(ws: WebSocket, session_id: str = Query(...)):
         room.masters.add(ws)
 
     # notify master of current names and default active status
-    await ws_send_safe(ws, {"type": "names", "L": room.names.get("L"), "R": room.names.get("R")})
+    await ws_send_safe(ws, {"type": "names", "L": room.names.get("L"), "R": room.names.get("R"), "E": room.names.get("E")})
     await ws_send_safe(ws, {"type": "status", "active": True, "session_id": session_id})
 
     last_ping = time.time()
@@ -483,8 +526,12 @@ async def ws_master(ws: WebSocket, session_id: str = Query(...)):
                         room.names["L"] = str(data["L"])
                     if "R" in data:
                         room.names["R"] = str(data["R"])
-                await broadcast_to_masters(session_id, {"type": "names", "L": room.names.get("L"), "R": room.names.get("R")})
-                await broadcast_to_clients(session_id, {"type": "names", "L": room.names.get("L"), "R": room.names.get("R")})
+                    if "E" in data:
+                        room.names["E"] = str(data["E"])
+                    if "E" in data:
+                        room.names["E"] = str(data["E"])
+                await broadcast_to_masters(session_id, {"type": "names", "L": room.names.get("L"), "R": room.names.get("R"), "E": room.names.get("E")})
+                await broadcast_to_clients(session_id, {"type": "names", "L": room.names.get("L"), "R": room.names.get("R"), "E": room.names.get("E")})
                 continue
 
             # master sending text (elder)
@@ -521,7 +568,7 @@ async def ws_client(ws: WebSocket, session_id: str = Query(...), channel: str | 
     room = get_or_create_room(session_id)
 
     channel = (channel or "DUAL").upper()
-    if channel not in ("L", "R", "DUAL"):
+    if channel not in ("L", "R", "E", "DUAL"):
         channel = "DUAL"
 
     with rooms_lock:
@@ -529,15 +576,15 @@ async def ws_client(ws: WebSocket, session_id: str = Query(...), channel: str | 
 
     # send current status and names
     await ws_send_safe(ws, {"type": "status", "active": True})
-    await ws_send_safe(ws, {"type": "names", "L": room.names.get("L"), "R": room.names.get("R")})
+    await ws_send_safe(ws, {"type": "names", "L": room.names.get("L"), "R": room.names.get("R"), "E": room.names.get("E")})
 
     last_ping = time.time()
 
     # per-channel audio streaming states (only used when receiving audio frames)
-    audio_states = {"L": make_audio_state(), "R": make_audio_state()}
-    last_seq = {"L": 0, "R": 0}
-    rx_frames = {"L": 0, "R": 0}
-    asr_error_reported = {"L": False, "R": False}
+    audio_states = {"L": make_audio_state(), "R": make_audio_state(), "E": make_audio_state()}
+    last_seq = {"L": 0, "R": 0, "E": 0}
+    rx_frames = {"L": 0, "R": 0, "E": 0}
+    asr_error_reported = {"L": False, "R": False, "E": False}
 
     try:
         while True:
@@ -571,7 +618,7 @@ async def ws_client(ws: WebSocket, session_id: str = Query(...), channel: str | 
                         room.names["L"] = str(data["L"])
                     if "R" in data:
                         room.names["R"] = str(data["R"])
-                await broadcast_to_masters(session_id, {"type": "names", "L": room.names.get("L"), "R": room.names.get("R")})
+                await broadcast_to_masters(session_id, {"type": "names", "L": room.names.get("L"), "R": room.names.get("R"), "E": room.names.get("E")})
                 continue
 
             # --- audio streaming (PCM16 mono 16k) ---
@@ -585,12 +632,19 @@ async def ws_client(ws: WebSocket, session_id: str = Query(...), channel: str | 
                     if len(raw) < 5:
                         continue
                     ch_id = raw[0]
-                    ch = "L" if ch_id == 0 else "R"
+                    if ch_id == 0:
+                        ch = "L"
+                    elif ch_id == 1:
+                        ch = "R"
+                    elif ch_id == 2:
+                        ch = "E"
+                    else:
+                        continue
                     seq = int.from_bytes(raw[1:5], "little", signed=False)
                     pcm = raw[5:]
                 else:
                     ch = str(data.get("channel", "L")).upper()
-                    if ch not in ("L", "R"):
+                    if ch not in ("L", "R", "E"):
                         ch = "L"
                     try:
                         pcm = base64.b64decode(data.get("data_b64", ""))
@@ -605,6 +659,17 @@ async def ws_client(ws: WebSocket, session_id: str = Query(...), channel: str | 
                 now = time.time()
 
                 frame_f32 = pcm16_bytes_to_float32(pcm)
+                # --- volume broadcast (throttled) ---
+                if frame_f32.size:
+                    rms_frame = float(np.sqrt(np.mean(np.square(frame_f32))))
+                else:
+                    rms_frame = 0.0
+                v = min(1.0, rms_frame * VOLUME_GAIN)
+                if (now - st.last_volume_ts) >= VOLUME_INTERVAL_SEC:
+                    st.last_volume_ts = now
+                    await broadcast_to_masters(session_id, {"type": "volume", "channel": ch, "value": v})
+                    await broadcast_to_clients(session_id, {"type": "volume", "channel": ch, "value": v})
+
 
                 speech_frame = True
                 if st.vad is not None:
@@ -662,10 +727,10 @@ async def ws_client(ws: WebSocket, session_id: str = Query(...), channel: str | 
                                     logger.exception(f"ASR partial failed for ch={ch}. Check CUDA/cuDNN/cublas or use ASR_DEVICE=cpu.")
                                     asr_error_reported[ch] = True
                                 text = ""
-                            text = (text or "").strip()
+                            text = clean_and_filter_text((text or "").strip(), is_partial=True)
                             if text and text != st.last_partial_text:
                                 st.last_partial_text = text
-                                speaker = room.names.get(ch) or ("说话人1" if ch == "L" else "说话人2")
+                                speaker = room.names.get(ch) or ("说话人1" if ch == "L" else ("说话人2" if ch == "R" else "老人"))
                                 await broadcast_to_masters(session_id, {
                                     "type": "asr_partial",
                                     "phase": "discussion",
@@ -686,14 +751,18 @@ async def ws_client(ws: WebSocket, session_id: str = Query(...), channel: str | 
                                 logger.exception(f"ASR final failed for ch={ch}. Check CUDA/cuDNN/cublas or use ASR_DEVICE=cpu.")
                                 asr_error_reported[ch] = True
                             final_text = ""
-                        final_text = (final_text or "").strip()
+                        final_text = clean_and_filter_text((final_text or "").strip(), is_partial=False)
+
+                        rms_final = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
+                        if rms_final < RMS_MIN_FINAL:
+                            final_text = ""
 
                         if final_text:
-                            speaker = room.names.get(ch) or ("说话人1" if ch == "L" else "说话人2")
+                            speaker = room.names.get(ch) or ("说话人1" if ch == "L" else ("说话人2" if ch == "R" else "老人"))
                             mid = db_add_message(
                                 session_id, "discussion", role="user", speaker=speaker,
                                 content=final_text, refined=None,
-                                extra={"from": "client_dual", "channel": ch, "seq": last_seq.get(ch, 0)}
+                                extra={"from": ("elder_mic" if ch=="E" else "client_dual"), "channel": ch, "seq": last_seq.get(ch, 0)}
                             )
                             await broadcast_to_masters(session_id, {
                                 "type": "text", "id": mid, "phase": "discussion",
