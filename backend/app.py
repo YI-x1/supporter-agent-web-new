@@ -260,6 +260,7 @@ MAX_UTTERANCE_SEC = float(os.environ.get('ASR_MAX_UTTERANCE_SEC', '12'))
 
 _whisper_model = None
 _whisper_lock = threading.Lock()
+_asr_infer_lock = threading.Lock()  # serialize ASR inference to avoid thread-safety issues
 
 def get_whisper_model():
     """Lazy-load ASR model.
@@ -298,14 +299,15 @@ def transcribe_text(audio_f32: np.ndarray) -> str:
     if audio_f32 is None or audio_f32.size == 0:
         return ''
     model = get_whisper_model()
-    segments, _info = model.transcribe(
-        audio_f32,
-        language=ASR_LANGUAGE,
-        vad_filter=False,
-        beam_size=3,
-        temperature=0.0,
-        condition_on_previous_text=False,
-    )
+    with _asr_infer_lock:
+        segments, _info = model.transcribe(
+            audio_f32,
+            language=ASR_LANGUAGE,
+            vad_filter=False,
+            beam_size=3,
+            temperature=0.0,
+            condition_on_previous_text=False,
+        )
     text = ''.join([s.text for s in segments]).strip()
     return text
 
@@ -782,17 +784,22 @@ async def ws_client(ws: WebSocket, session_id: str = Query(...), channel: str | 
                         win = int(16000 * PARTIAL_WINDOW_SEC)
                         audio_win = audio[-win:] if audio.shape[0] > win else audio
                         rms = float(np.sqrt(np.mean(np.square(audio_win)))) if audio_win.size else 0.0
+
+                        # IMPORTANT: always initialize `text` to avoid UnboundLocalError when rms is low
+                        text = ""
                         if rms >= RMS_MIN:
                             try:
-                                text = transcribe_text(audio_win)
+                                # Run ASR in a worker thread to avoid blocking the websocket receive loop
+                                text = await asyncio.to_thread(transcribe_text, audio_win)
                             except Exception:
                                 if not asr_error_reported[ch]:
                                     logger.exception(f"ASR partial failed for ch={ch}. Check CUDA/cuDNN/cublas or use ASR_DEVICE=cpu.")
                                     asr_error_reported[ch] = True
                                 text = ""
                             text = (text or "").strip()
+
                         duration_sec = float(audio_win.shape[0]) / 16000.0
-                        if not should_keep_asr_text(text, is_final=False, rms=rms, duration_sec=duration_sec):
+                        if text and (not should_keep_asr_text(text, is_final=False, rms=rms, duration_sec=duration_sec)):
                             text = ""
                         if text and text != st.last_partial_text:
 
@@ -809,10 +816,14 @@ async def ws_client(ws: WebSocket, session_id: str = Query(...), channel: str | 
 
                 # Finalize: end by silence
                 if st.silence_run >= END_SILENCE_FRAMES:
-                    if total_samples >= int(16000 * MIN_FINAL_SEC):
-                        audio = concat_audio(st.speech_chunks)
+                    # Always build audio so later gating/reset never references undefined vars
+                    audio = concat_audio(st.speech_chunks)
+                    final_text = ""
+
+                    if audio.size and audio.shape[0] >= int(16000 * MIN_FINAL_SEC):
                         try:
-                            final_text = transcribe_text(audio)
+                            # Run ASR in a worker thread to avoid blocking the websocket receive loop
+                            final_text = await asyncio.to_thread(transcribe_text, audio)
                         except Exception:
                             if not asr_error_reported[ch]:
                                 logger.exception(f"ASR final failed for ch={ch}. Check CUDA/cuDNN/cublas or use ASR_DEVICE=cpu.")
@@ -822,7 +833,7 @@ async def ws_client(ws: WebSocket, session_id: str = Query(...), channel: str | 
 
                     # final gating + hallucination suppression + short-window de-dup
                     rms_final = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
-                    duration_sec = float(audio.shape[0]) / 16000.0
+                    duration_sec = float(audio.shape[0]) / 16000.0 if audio.size else 0.0
                     if final_text and should_keep_asr_text(final_text, is_final=True, rms=rms_final, duration_sec=duration_sec):
                         key = (session_id, phase_now, ch)
                         now_ts = time.time()
@@ -889,7 +900,7 @@ async def ws_client(ws: WebSocket, session_id: str = Query(...), channel: str | 
     except WebSocketDisconnect:
         pass
     except Exception:
-        pass
+        logger.exception(f"ws_client crashed: session_id={session_id} channel={channel}")
     finally:
         remove_ws(session_id, ws)
 
